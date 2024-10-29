@@ -62,6 +62,9 @@ from ..graph import (
     ClampMaxOp,
     RandIntLowOp,
     ArgMaxOp,
+    GreaterThanOp,
+    CopyOp,
+    ScatterOp,
 )
 from .utils import *
 
@@ -1330,7 +1333,7 @@ def mean_op(node: MeanOp, symbol_table):
     From Buddy MeanOp to MLIR TOSA operation.
     """
     input_tensor = symbol_table.get((str(node.args[0]), 0))
-    keepdim = node.args[2]
+    keepdim = node.args[2] if node.args.__len__() == 3 else None
     dims = [x for x in node.args[1]]
     if isinstance(dims, int):
         dims = [dims]
@@ -1479,6 +1482,52 @@ def argmax_op(node: ArgMaxOp, symbol_table):
     return op
 
 
+def greater_than_op(node: GreaterThanOp, symbol_table: dict):
+    input1 = symbol_table.get((str(node.args[0]), 0), node.args[0])
+    input2 = symbol_table.get((str(node.args[1]), 0), node.args[1])
+    
+    result_shape = ir.RankedTensorType(input1.type).shape
+    result_type = ir.IntegerType.get_signless(1)
+    result = ir.RankedTensorType.get(result_shape, result_type)
+    op = tosa.GreaterOp(result, input1, input2)
+    
+    return op
+
+
+def copy_op(node: CopyOp, symbol_table: dict):
+    input_tensor = symbol_table.get((str(node.args[1]), 0))
+    sizes = ir.RankedTensorType(input_tensor.type).shape
+    result_element_type = ir.RankedTensorType(input_tensor.type).element_type
+    output_type = ir.RankedTensorType.get(sizes, result_element_type)
+
+    return tosa.IdentityOp(output_type, input_tensor)
+
+
+def scatter_op(node: ScatterOp, symbol_table: dict):
+    dest = symbol_table.get((str(node.args[0]), 0))
+    src = symbol_table.get((str(node.args[1]), 0))
+    dim = [node.args[2]]
+    indices_const = [node.args[3]]
+    
+    result_shape = ir.RankedTensorType(dest.type).shape
+    result_type = ir.RankedTensorType(dest.type).element_type
+    result = ir.RankedTensorType.get(result_shape, result_type)
+    
+    src_shape = ir.RankedTensorType(src.type).shape
+    src = tosa.ReshapeOp(src, memoryview(array.array("i", [1] + src_shape)))
+    
+    indices_type = ir.RankedTensorType.get([1, 1], ir.IntegerType.get_signless(32))
+    indices_value = ir.DenseElementsAttr.get(numpy.array(indices_const, dtype=numpy.int32).reshape((1, 1)), type=indices_type)
+    indices = tosa.ConstOp(indices_value).result
+    
+    scatter_dims = ir._denseI64ArrayAttr(dim, None)
+    
+    unique = ir._unitAttr(True, None)
+    
+    op = tensor.ScatterOp(result, src, dest, indices, scatter_dims, unique=unique)
+    return op
+
+
 ops_registry = {
     "AddOp": add_op,
     "MulOp": mul_op,
@@ -1515,4 +1564,8 @@ ops_registry = {
     "ClampMaxOp": clamp_max_op,
     "RandIntLowOp": randint_low_op,
     "ArgMaxOp": argmax_op,
+    "GreaterThanOp": greater_than_op,
+    "CopyOp": copy_op,
+    "ScatterOp": scatter_op,
 }
+    

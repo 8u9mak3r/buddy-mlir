@@ -167,6 +167,9 @@ class DynamoCompiler:
             "split.Tensor":SplitOp,
             "max.default":MaxOp,
             "gt.Scalar":GtOp,
+            "gt.Tensor": GreaterThanOp,
+            "copy.default": CopyOp,
+            "select_scatter.default": ScatterOp,
         }
 
     @property
