@@ -170,6 +170,8 @@ class DynamoCompiler:
             "gt.Tensor": GreaterThanOp,
             "copy.default": CopyOp,
             "select_scatter.default": ScatterOp,
+            "round.default": RoundOp,
+            "__rshift__.Scalar": RightShiftOp,
         }
 
     @property
@@ -196,6 +198,8 @@ class DynamoCompiler:
                 return TensorDType.Float64
             case "torch.bool":
                 return TensorDType.Bool
+            case "torch.int8":
+                return TensorDType.Int8
             case _:
                 raise NotImplementedError(f"Unsupported dtype: {dtype}")
 

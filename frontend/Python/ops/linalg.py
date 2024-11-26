@@ -1143,8 +1143,10 @@ def matmul_op(
     output_shape = list(node.tensor_meta["shape"])
     dtype = node.tensor_meta["dtype"]
     mlir_dtype = mlir_element_type_get(dtype)
+    if dtype == TensorDType.Int8: mlir_dtype = ir.IntegerType.get_signless(32)
     tensor_type = ir.RankedTensorType.get(output_shape, mlir_dtype)
-    element = mlir_element_attr_get(dtype, 0.0)
+    element = mlir_element_attr_get(dtype, 0)
+    if dtype == TensorDType.Int8: element = ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 0)
     attr = ir.DenseElementsAttr.get_splat(tensor_type, element)
     matmul_result_buffer = arith.ConstantOp(tensor_type, attr).result
     op = linalg.matmul(input1, input2, outs=[matmul_result_buffer])

@@ -259,6 +259,8 @@ class Graph:
                     np_type = np.dtype(np.int64)
                 case "f32":
                     np_type = np.dtype(np.float32)
+                case "i8":
+                    np_type = np.dtype(np.int8)
                 case _:
                     raise NotImplementedError(f"Unsupported dtype {dtype}")
             self._output_memref.append(
@@ -398,6 +400,8 @@ class GraphImporter:
                 return ir.F32Type.get()
             case TensorDType.Bool:
                 return ir.IntegerType.get_signless(1)
+            case TensorDType.Int8:
+                return ir.IntegerType.get_signless(8)
             case _:
                 raise NotImplementedError(f"Unsupported dtype {dtype}")
 

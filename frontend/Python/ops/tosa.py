@@ -65,6 +65,8 @@ from ..graph import (
     GreaterThanOp,
     CopyOp,
     ScatterOp,
+    RoundOp,
+    RightShiftOp,
 )
 from .utils import *
 
@@ -522,6 +524,7 @@ def convert_element_type_op(node: ConvertElementTypeOp, symbol_table):
         TensorDType.Int64: ir.IntegerType.get_signless(64),
         TensorDType.Int32: ir.IntegerType.get_signless(32),
         TensorDType.Bool: ir.IntegerType.get_signless(1),
+        TensorDType.Int8: ir.IntegerType.get_signless(8),
     }
     input_tensor = symbol_table.get((str(node.args[0]), 0))
     to_cast_type = types_mapping[node.args[1]]
@@ -1047,7 +1050,7 @@ def convolution2d_op(node: Conv2dOp, symbol_table):
             input_padding = [input_padding[0]] * 4
         elif len(input_padding) == 2:
             input_padding = [input_padding[0]] * 2 + [input_padding[1]] * 2
-        # Prepare input_padding attributes.
+        # Prepare input_padding attributes
         input_padding_attr = ir._denseI64ArrayAttr(input_padding, None)
         # If the input layout is NCHW, then convert to NHWC.
         if node._layout.find("NCHW") != -1:
@@ -1076,6 +1079,7 @@ def convolution2d_op(node: Conv2dOp, symbol_table):
             perm_shape.append(out_shape[3])
             perm_shape.append(out_shape[1])
             out_shape = perm_shape
+        
         output_type = ir.RankedTensorType.get(out_shape, result_element_type)
 
         # Depthwise Conv2D Operation.
@@ -1148,6 +1152,12 @@ def convolution2d_op(node: Conv2dOp, symbol_table):
                         weight_val,
                         perm_const_op.results[0],
                     ).result
+                    
+                if dtype == TensorDType.Int8:
+                  conv_result_buffer_type = ir.RankedTensorType.get(out_shape, ir.IntegerType.get_signless(32))
+                  conv_result_buffer_element = ir.DenseElementsAttr.get_splat(conv_result_buffer_type, ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 0))
+                  conv_result_buffer = arith.ConstantOp(conv_result_buffer_type, conv_result_buffer_element).result
+                
                 op = tosa.Conv2DOp(
                     output_type,
                     input_val,
@@ -1156,6 +1166,8 @@ def convolution2d_op(node: Conv2dOp, symbol_table):
                     input_padding_attr,
                     stride_attr,
                     dilation_attr,
+                ) if dtype != TensorDType.Int8 else linalg.conv_2d_nhwc_fhwc(
+                    input_val, weight_val, outs=[conv_result_buffer], strides=stride_attr, dilations=dilation_attr
                 )
         # Output transpose
         if node._layout.find("NCHW") != -1:
@@ -1172,9 +1184,11 @@ def convolution2d_op(node: Conv2dOp, symbol_table):
             perm_shape.append(out_shape[2])
             permute_result_type = ir.RankedTensorType.get(
                 perm_shape, result_element_type
+            ) if dtype != TensorDType.Int8 else ir.RankedTensorType.get(
+                perm_shape, ir.IntegerType.get_signless(32)
             )
             op = tosa.TransposeOp(
-                permute_result_type, op.result, perm_const_op.results[0]
+                permute_result_type, op, perm_const_op.results[0]
             )
     # Convolution 1D
     elif len(weight_shape) == 3:
@@ -1401,8 +1415,12 @@ def clamp_min_op(node: ClampMinOp, symbol_table):
     min_value = symbol_table.get((str(node.args[1]), 0), node.args[1])
     tensor_type = input1.type
     min_value_int = round(min_value)
+    
+    input_element_type = ir.RankedTensorType(input1.type).element_type
+    bits = int(str(input_element_type)[1:])
+    
     min_int = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), min_value_int)
-    max_int = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), sys.maxsize)
+    max_int = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), 2**(bits-1) - 1)
     min_fp = ir.FloatAttr.get(ir.F32Type.get(), min_value)
     max_fp = ir.FloatAttr.get(ir.F32Type.get(), float("inf"))
     op = tosa.ClampOp(tensor_type, input1, min_int, max_int, min_fp, max_fp)
@@ -1427,9 +1445,13 @@ def clamp_max_op(node: ClampMaxOp, symbol_table):
     input1 = symbol_table.get((str(node.args[0]), 0), node.args[0])
     max_value = symbol_table.get((str(node.args[1]), 0), node.args[1])
     tensor_type = input1.type
-    min_value_int = round(max_value)
-    min_int = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), -sys.maxsize)
-    max_int = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), min_value_int)
+    max_value_int = round(max_value)
+    
+    input_element_type = ir.RankedTensorType(input1.type).element_type
+    bits = int(str(input_element_type)[1:])
+    
+    min_int = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), -2**(bits-1))
+    max_int = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), max_value_int)
     min_fp = ir.FloatAttr.get(ir.F32Type.get(), -float("inf"))
     max_fp = ir.FloatAttr.get(ir.F32Type.get(), max_value)
     op = tosa.ClampOp(tensor_type, input1, min_int, max_int, min_fp, max_fp)
@@ -1526,6 +1548,35 @@ def scatter_op(node: ScatterOp, symbol_table: dict):
     
     op = tensor.ScatterOp(result, src, dest, indices, scatter_dims, unique=unique)
     return op
+  
+
+def round_op(node: RoundOp, symbol_table: dict):
+    input = symbol_table.get((str(node.args[0]), 0))
+    
+    sizes = ir.RankedTensorType(input.type).shape
+    result_element_type = ir.RankedTensorType(input.type).element_type
+    output_type = ir.RankedTensorType.get(sizes, result_element_type)
+  
+    return tosa.FloorOp(output_type, input)
+  
+
+def right_shift_op(node: RightShiftOp, symbol_table: dict):
+    input = symbol_table.get((str(node.args[0]), 0))
+    shift_bits = node.args[1]
+    
+    result_shape = ir.RankedTensorType(input.type).shape
+    result_element_type = ir.RankedTensorType(input.type).element_type
+    result = ir.RankedTensorType.get(result_shape, result_element_type)
+    shift_shape = [1] * len(result_shape)
+    
+    shift_type = ir.RankedTensorType.get(shift_shape, ir.IntegerType.get_signless(32))
+    shift_value = ir.DenseElementsAttr.get(numpy.array(shift_bits, dtype=numpy.int32).reshape(shift_shape), type=shift_type)
+    
+    shift = tosa.ConstOp(shift_value).result
+    round = ir._unitAttr(False, None)
+    op = tosa.ArithmeticRightShiftOp(result, input, shift, round=round)
+  
+    return op
 
 
 ops_registry = {
@@ -1567,5 +1618,7 @@ ops_registry = {
     "GreaterThanOp": greater_than_op,
     "CopyOp": copy_op,
     "ScatterOp": scatter_op,
+    "RoundOp": round_op,
+    "RightShiftOp": right_shift_op,
 }
     
