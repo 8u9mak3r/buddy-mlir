@@ -63,6 +63,7 @@ from ..graph import (
     RandIntLowOp,
     ArgMaxOp,
     ScaledDotProductFlashAttentionForCpuOp,
+    BitwiseAndOp,
 )
 from .utils import *
 
@@ -1796,6 +1797,16 @@ def scaled_dot_product_flash_attention_for_cpu_op(
     return result_reshape_op, log_sumexp
 
 
+def bitwise_and_op(node: BitwiseAndOp, symbol_table):
+    """
+    Import tensor addition operation.
+    From buddy graph ir's `AddOp` operator to MLIR TOSA `add` operation.
+    """
+    input1 = symbol_table.get((str(node.args[0]), 0), node.args[0])
+    input2 = symbol_table.get((str(node.args[1]), 0), node.args[1])
+    return _gen_arith_binary_op(input1, input2, tosa.LogicalAndOp)
+
+
 ops_registry = {
     "AddOp": add_op,
     "MulOp": mul_op,
@@ -1833,4 +1844,5 @@ ops_registry = {
     "RandIntLowOp": randint_low_op,
     "ArgMaxOp": argmax_op,
     "ScaledDotProductFlashAttentionForCpuOp": scaled_dot_product_flash_attention_for_cpu_op,
+    "BitwiseAndOp": bitwise_and_op,
 }

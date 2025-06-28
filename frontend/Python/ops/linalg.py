@@ -2533,6 +2533,66 @@ def slice_scatter_op(node: SliceScatterOp, symbol_table):
     return insert_op.result
 
 
+def ne_op(
+    node: NeOp,
+    symbol_table: Dict[Tuple[str, int], ir.Operation],
+):
+    """
+    Import the tensor greater equal operation.
+    From buddy GreaterEqualOp to MLIR arith `constant` operation.
+    Note: This op, campare two input nodes, and output bool tensor to represent
+    compare result.
+    Args:
+        node: Containing information from the input graph node.
+        symbol_table: A dictionary mapping symbols to their corresponding
+        operations.
+    Returns:
+        op: The operation return the linalg.generic op.
+    """
+    input_tensor = symbol_table.get((str(node.args[0]), 0), node.args[0])
+    input_dtype = ir.RankedTensorType(input_tensor.type).element_type
+    input_shape = ir.RankedTensorType(input_tensor.type).shape
+    tensor_type = ir.RankedTensorType.get(input_shape, input_dtype)
+
+    scalar = arith.ConstantOp(input_dtype, node.args[1])
+    rhs = tensor.SplatOp(tensor_type, scalar)
+
+    equal_op = tosa.EqualOp(input_tensor, rhs)
+    output_type = ir.RankedTensorType.get(input_shape, ir.IntegerType.get_signless(1))
+
+    return tosa.LogicalNotOp(output_type, equal_op.results[0])
+
+
+def le_op(
+    node: LeOp,
+    symbol_table: Dict[Tuple[str, int], ir.Operation],
+):
+    """
+    Import the tensor greater equal operation.
+    From buddy GreaterEqualOp to MLIR arith `constant` operation.
+    Note: This op, campare two input nodes, and output bool tensor to represent
+    compare result.
+    Args:
+        node: Containing information from the input graph node.
+        symbol_table: A dictionary mapping symbols to their corresponding
+        operations.
+    Returns:
+        op: The operation return the linalg.generic op.
+    """
+    input_tensor = symbol_table.get((str(node.args[0]), 0), node.args[0])
+    input_dtype = ir.RankedTensorType(input_tensor.type).element_type
+    input_shape = ir.RankedTensorType(input_tensor.type).shape
+    tensor_type = ir.RankedTensorType.get(input_shape, input_dtype)
+
+    scalar = arith.ConstantOp(input_dtype, node.args[1])
+    rhs = tensor.SplatOp(tensor_type, scalar)
+    output_type = ir.RankedTensorType.get(input_shape, ir.IntegerType.get_signless(1))
+
+    cmp_op = tosa.GreaterOp(output_type, rhs, input_tensor)
+
+    return cmp_op
+
+
 ops_registry = {
     "MatmulOp": matmul_op,
     "TransposeMatmulFusedOp": matmul_transpose_b_op,
@@ -2575,4 +2635,6 @@ ops_registry = {
     "EqualOp": equal_op,
     "CopyOp": copy_op,
     "SliceScatterOp": slice_scatter_op,
+    "NeOp": ne_op,
+    "LeOp": le_op,
 }

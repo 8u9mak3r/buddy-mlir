@@ -176,6 +176,9 @@ class DynamoCompiler:
             "eq.Scalar": EqualOp,
             "copy.default": CopyOp,
             "slice_scatter.default": SliceScatterOp,
+            "ne.Scalar": NeOp,
+            "le.Scalar": LeOp,
+            "bitwise_and.Tensor": BitwiseAndOp,
         }
 
     @property
