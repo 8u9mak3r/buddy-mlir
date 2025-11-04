@@ -179,6 +179,7 @@ class DynamoCompiler:
             "ne.Scalar": NeOp,
             "le.Scalar": LeOp,
             "bitwise_and.Tensor": BitwiseAndOp,
+            "_weight_int4pack_mm_for_cpu.default": WeightInt4PackMMForCpuOp,
         }
 
     @property
@@ -207,6 +208,8 @@ class DynamoCompiler:
                 return TensorDType.Float64
             case "torch.bool":
                 return TensorDType.Bool
+            case "torch.uint8":
+                return TensorDType.UInt8
             case _:
                 raise NotImplementedError(f"Unsupported dtype: {dtype}")
 
@@ -336,6 +339,10 @@ class DynamoCompiler:
             gm_nodes = param_nodes + buffers_nodes + input_nodes + other_nodes
 
             for gm_node in gm_nodes:
+                      
+                # print(gm_node.graph)
+                # exit(0)
+                
                 node_users = []
                 for user in gm_node.users.keys():
                     node_users.append(str(user))
@@ -374,6 +381,7 @@ class DynamoCompiler:
                     tensor_meta = gm_node.meta.get("tensor_meta")
                     val = gm_node.meta.get("val")
                     # num_returns = len(gm_node.target._schema.returns)
+                    
                     num_returns = (
                         len(val)
                         if isinstance(val, list)

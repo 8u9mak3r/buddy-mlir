@@ -64,6 +64,7 @@ from ..graph import (
     ArgMaxOp,
     ScaledDotProductFlashAttentionForCpuOp,
     BitwiseAndOp,
+    WeightInt4PackMMForCpuOp,
 )
 from .utils import *
 
@@ -85,6 +86,7 @@ def _gen_arith_binary_op(input1, input2, op_func):
     """Generate arithmetic binary operation. Most binary operations follow the
     same pattern.
     So we can use one function to generate them, avoiding code duplication."""
+
     input1, input2 = _normalize_binary_operator_args(input1, input2)
 
     input1_shape = ir.RankedTensorType(input1.type).shape
@@ -106,7 +108,7 @@ def _gen_arith_binary_op(input1, input2, op_func):
             input2, memoryview(array.array("i", norm_input2_shape))
         ).result
 
-    result_element_type = ir.RankedTensorType(input1.type).element_type
+    result_element_type = ir.RankedTensorType(input1.type).element_type  
     result_tensor_type = ir.RankedTensorType.get(
         broadcasted_result_shp, result_element_type
     )
@@ -279,6 +281,28 @@ def sub_op(node: SubOp, symbol_table):
     """
     input1 = symbol_table.get((str(node.args[0]), 0), node.args[0])
     input2 = symbol_table.get((str(node.args[1]), 0), node.args[1])
+    
+    dtype = node.tensor_meta["dtype"]
+    mlir_dtype = mlir_element_type_get(dtype)
+    if isinstance(node.args[0], str) and isinstance(node.args[1], str):
+        input1_dtype = ir.RankedTensorType(input1.type).element_type
+        input2_dtype = ir.RankedTensorType(input2.type).element_type
+        if input1_dtype != mlir_dtype:
+            input1 = tosa.CastOp(
+                ir.RankedTensorType.get(
+                    ir.RankedTensorType(input1.type).shape,
+                    mlir_dtype,
+                ),
+                input1,
+            ).result
+        if input2_dtype != mlir_dtype:
+            input2 = tosa.CastOp(
+                ir.RankedTensorType.get(
+                    ir.RankedTensorType(input2.type).shape,
+                    mlir_dtype,
+                ),
+                input2,
+            ).result
     return _gen_arith_binary_op(input1, input2, tosa.SubOp)
 
 
@@ -926,6 +950,8 @@ def expand_op(node: ExpandOp, symbol_table) -> ir.Operation:
     result_element_type = ir.RankedTensorType(
         to_expand_tensor.type
     ).element_type
+    
+    print(result_element_type)
     if result_element_type in (
         ir.IntegerType.get_signless(1),
         ir.IntegerType.get_signless(64),
@@ -1629,7 +1655,7 @@ def scaled_dot_product_flash_attention_for_cpu_op(
     if len(node.args) == 5:
         dropout_p = node.args[3]
         is_causal = node.args[4]
-        assert dropout_p != 0.0
+        # assert dropout_p != 0.0
         assert is_causal == True
 
     attn_mask = node.kwargs.get("attn_mask", None)
@@ -1804,8 +1830,205 @@ def bitwise_and_op(node: BitwiseAndOp, symbol_table):
     """
     input1 = symbol_table.get((str(node.args[0]), 0), node.args[0])
     input2 = symbol_table.get((str(node.args[1]), 0), node.args[1])
+    
+    input1_dtype = str(ir.RankedTensorType(input1.type).element_type)
+    input2_dtype = str(ir.RankedTensorType(input2.type).element_type)
+    assert(input1_dtype == 'i1' and input2_dtype == 'i1', "Data types of both operands of Bitwise AND must be i1.")
     return _gen_arith_binary_op(input1, input2, tosa.LogicalAndOp)
 
+
+def weight_int4pack_mm_for_cpu_op(node: WeightInt4PackMMForCpuOp, symbol_table):
+    input = symbol_table.get((str(node.args[0]), 0), node.args[0])
+    weight = symbol_table.get((str(node.args[1]), 0), node.args[1])
+    
+    input_shape = ir.RankedTensorType(input.type).shape
+    dtype = node.tensor_meta["dtype"]
+    weight_shape = ir.RankedTensorType(weight.type).shape
+    weight_type = ir.RankedTensorType(weight.type).element_type
+    
+    dim_count = len(weight_shape)
+    assert(dim_count == 2 and len(input_shape) == 2)
+    assert(input_shape[1] == weight_shape[1] * 2) # matmul shape match after weight unzipped
+    
+    """Unpack weight"""
+    unpacked_weight_shape = weight_shape
+    unpacked_weight_shape[1] = unpacked_weight_shape[1] << 1
+    unpacked_weight_type = mlir_element_type_get(dtype)
+    unpacked_weight_tensor = tensor.EmptyOp(unpacked_weight_shape, weight_type) # weight type remains unchanged till dequantization 
+    
+    
+    d0 = ir.AffineDimExpr.get(0)   
+    d1 = ir.AffineDimExpr.get(1)  
+    c1 = ir.AffineConstantExpr.get(1)  # const 1 
+    c2 = ir.AffineConstantExpr.get(2)  # const 2
+
+    # build expr 2 * d1 and 2 * d1 + 1
+    expr = [d0, d1]
+    expr2d = [d0, d1 * c2]
+    expr2d1 = [d0, d1 * c2 + c1]
+
+    # build affine maps
+    const_affine_map = ir.AffineMap.get(dim_count=dim_count, symbol_count=0, exprs=expr)  # affine_map<(d0, d1) -> (d0, d1)>
+    affine_map_2d = ir.AffineMap.get(dim_count=dim_count, symbol_count=0, exprs=expr2d) # affine_map<(d0, d1) -> (d0, d1 * 2)>
+    affine_map_2d1 = ir.AffineMap.get(dim_count=dim_count, symbol_count=0, exprs=expr2d1) # affine_map<(d0, d1) -> (d0, d1 * 2 + 1)>
+    
+    # unpacked_weight[i][2 * j] = packed_weight[i][j] >> 4
+    generic_unpack_op1 = linalg.GenericOp(
+        [ir.RankedTensorType.get(unpacked_weight_shape, weight_type)], # weight type remains unchanged till dequantization
+        [weight],
+        [unpacked_weight_tensor],
+        ir.ArrayAttr.get(
+            [ir.AffineMapAttr.get(const_affine_map), ir.AffineMapAttr.get(affine_map_2d)]
+        ),
+        ir.ArrayAttr.get(
+            [ir.Attribute.parse("#linalg.iterator_type<parallel>")] * dim_count
+        ),
+    )
+    block = ir.Block.create_at_start(
+        generic_unpack_op1.region,
+        [
+            weight_type,
+            weight_type,
+        ],
+    )
+    
+    sbits = arith.ConstantOp(ir.IntegerType.get_signless(8), 4)
+    mid_point = arith.ConstantOp(ir.IntegerType.get_signless(8), 8)
+    high = arith.ShRUIOp(block.arguments[0], sbits)
+    dequant_preprocess = arith.SubIOp(high.result, mid_point)
+    block.append(sbits)
+    block.append(mid_point)
+    block.append(high)
+    block.append(dequant_preprocess)
+    block.append(linalg.YieldOp([dequant_preprocess.result]))
+    
+    # unpacked_weight[i][2 * j + 1] = packed_weight[i][j] & 0xF
+    generic_unpack_op2 = linalg.GenericOp(
+        [ir.RankedTensorType.get(unpacked_weight_shape, weight_type)], # weight type remains unchanged till dequantization
+        [weight],
+        [generic_unpack_op1.results[0]],
+        ir.ArrayAttr.get(
+            [ir.AffineMapAttr.get(const_affine_map), ir.AffineMapAttr.get(affine_map_2d1)]
+        ),
+        ir.ArrayAttr.get(
+            [ir.Attribute.parse("#linalg.iterator_type<parallel>")] * dim_count
+        ),
+    )
+    block = ir.Block.create_at_start(
+        generic_unpack_op2.region,
+        [
+            weight_type,
+            weight_type,
+        ],
+    )
+    
+    sbits = arith.ConstantOp(ir.IntegerType.get_signless(8), 0x0F)
+    mid_point = arith.ConstantOp(ir.IntegerType.get_signless(8), 8)
+    low = arith.AndIOp(block.arguments[0], sbits)
+    dequant_preprocess = arith.SubIOp(low.result, mid_point)
+    block.append(sbits)
+    block.append(mid_point)
+    block.append(low)
+    block.append(dequant_preprocess)
+    block.append(linalg.YieldOp([dequant_preprocess.result]))
+    
+    
+    """Prepare scale tensor and zero_point tensor"""
+    group_size = node.args[2]
+    scale_and_zero = symbol_table.get((str(node.args[3]), 0), node.args[3])
+    scale_and_zero_shape = ir.RankedTensorType(scale_and_zero.type).shape
+    scale_and_zero_type = ir.RankedTensorType(scale_and_zero.type).element_type
+    
+    # check shape constraints
+    assert(len(scale_and_zero_shape) == 3)
+    assert(group_size == unpacked_weight_shape[1] / scale_and_zero_shape[0])
+    assert(scale_and_zero_shape[1] == unpacked_weight_shape[0])
+    assert(scale_and_zero_shape[2] == 2)
+    
+    # Transpose to make dim0 of scale_and zero match dim0 of unzipped weight
+    perm_const_op = tosa.ConstOp(
+        ir.DenseElementsAttr.get(memoryview(array.array("i", [1, 0, 2])))
+    )
+    new_shape = [scale_and_zero_shape[1], scale_and_zero_shape[0], scale_and_zero_shape[2]]
+    transposed_tensor_type = ir.RankedTensorType.get(new_shape, scale_and_zero_type)
+    transposed_scale_and_zero = tosa.TransposeOp(transposed_tensor_type, scale_and_zero, perms=perm_const_op.results[0])
+    
+    # Extract scale tensor and zero_point tensor
+    scale_offsets, zero_offsets = [0, 0, 0], [0, 0, 1]
+    scale_offsets_attr, zero_offsets_attr = ir._denseI64ArrayAttr(scale_offsets, None), ir._denseI64ArrayAttr(zero_offsets, None)
+    scale_shape, zero_shape = [new_shape[0], new_shape[1], 1], [new_shape[0], new_shape[1], 1]
+    scale_shape_attr, zero_shape_attr = ir._denseI64ArrayAttr(scale_shape, None), ir._denseI64ArrayAttr(zero_shape, None)
+    scale_strides, zero_strides = [1, 1, 1], [1, 1, 1]
+    scale_strides_attr, zero_strides_attr = ir._denseI64ArrayAttr(scale_strides, None), ir._denseI64ArrayAttr(zero_strides, None)
+    
+    extract_slice_result_type = ir.RankedTensorType.get(scale_shape, scale_and_zero_type)
+    scale = tensor.ExtractSliceOp(
+        extract_slice_result_type,
+        transposed_scale_and_zero,
+        [],
+        [],
+        [],
+        scale_offsets_attr,
+        scale_shape_attr,
+        scale_strides_attr,
+    ).result
+    zero_point = tensor.ExtractSliceOp(
+        extract_slice_result_type,
+        transposed_scale_and_zero,
+        [],
+        [],
+        [],
+        zero_offsets_attr,
+        zero_shape_attr,
+        zero_strides_attr,
+    ).result
+    
+    
+    """Dequantization"""
+    fp_weight = tosa.CastOp(
+        ir.RankedTensorType.get(unpacked_weight_shape, unpacked_weight_type),
+        generic_unpack_op2.results[0]
+    ).result
+    
+    reshaped_fp_weight = tosa.ReshapeOp(
+        fp_weight, memoryview(array.array("i", [scale_shape[0], scale_shape[1], group_size]))
+    ).result
+    
+    dequant_weight_type = ir.RankedTensorType.get(
+        ir.RankedTensorType(reshaped_fp_weight.type).shape,
+        ir.RankedTensorType(reshaped_fp_weight.type).element_type,
+    )
+    dequant_weight = tosa.MulOp(
+        dequant_weight_type, 
+        reshaped_fp_weight, 
+        scale, 
+        shift=ir.IntegerAttr.get(ir.IntegerType.get_signless(8), 0),
+    )
+    dequant_weight = tosa.AddOp(
+        dequant_weight_type, 
+        dequant_weight, 
+        zero_point
+    )
+    
+    reshaped_back_weight = tosa.ReshapeOp(
+        dequant_weight, memoryview(array.array("i", [unpacked_weight_shape[0], unpacked_weight_shape[1]]))
+    ).result
+    
+    """Transpose & Matmul"""
+    perm_const_op = tosa.ConstOp(
+        ir.DenseElementsAttr.get(memoryview(array.array("i", [1, 0])))
+    )
+    new_shape = [unpacked_weight_shape[1], unpacked_weight_shape[0]]
+    transposed_weight_buffer = ir.RankedTensorType.get(new_shape, unpacked_weight_type)
+    transposed_weight = tosa.TransposeOp(transposed_weight_buffer, reshaped_back_weight, perm_const_op.results[0])
+    
+    matmul_result = ir.RankedTensorType.get([input_shape[0], new_shape[1]], mlir_element_type_get(dtype))
+    matmul_result_attr = ir.DenseElementsAttr.get_splat(matmul_result, mlir_element_attr_get(dtype, 0.0))
+    matmul_result_buffer = arith.ConstantOp(matmul_result, matmul_result_attr).result
+    op = linalg.matmul(input, transposed_weight.result, outs=[matmul_result_buffer])
+    return op
+    
+    
 
 ops_registry = {
     "AddOp": add_op,
@@ -1845,4 +2068,5 @@ ops_registry = {
     "ArgMaxOp": argmax_op,
     "ScaledDotProductFlashAttentionForCpuOp": scaled_dot_product_flash_attention_for_cpu_op,
     "BitwiseAndOp": bitwise_and_op,
+    "WeightInt4PackMMForCpuOp": weight_int4pack_mm_for_cpu_op,
 }

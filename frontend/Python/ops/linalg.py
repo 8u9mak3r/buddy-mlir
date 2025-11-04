@@ -819,7 +819,7 @@ def pow_op(
     input1 = symbol_table.get((str(node.args[0]), 0))
     if input1 is None:
         return
-    value = node.args[1]
+    value = int(node.args[1])
     output_shape = list(node.tensor_meta["shape"])
     dtype = node.tensor_meta["dtype"]
     dtype = mlir_element_type_get(dtype)
