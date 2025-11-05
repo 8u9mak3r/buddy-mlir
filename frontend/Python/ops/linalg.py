@@ -1350,11 +1350,41 @@ def neg_op(
     input1 = symbol_table.get((str(node.args[0]), 0))
     if input1 is None:
         return
+    
     output_shape = list(node.tensor_meta["shape"])
+    # output_shape = ir.RankedTensorType(input1.type).shape
     dtype = node.tensor_meta["dtype"]
     mlir_dtype = mlir_element_type_get(dtype)
-    output = tensor.EmptyOp(output_shape, mlir_dtype)
-    op = linalg.negf(input1, outs=output)
+    outputs = tensor.EmptyOp(output_shape, mlir_dtype)
+    result_tensors = ir.RankedTensorType.get(output_shape, mlir_dtype)
+    # op = linalg.NegfOp([result_tensors], [input1], [outputs])
+    
+    dim_count = len(output_shape)
+    const_affine_expr = [ir.AffineDimExpr.get(i) for i in range(dim_count)]
+    const_affine_map = ir.AffineMap.get(dim_count=dim_count, symbol_count=0, exprs=const_affine_expr)  # affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+    
+    op = linalg.GenericOp(
+        [result_tensors],
+        [input1],
+        [outputs],
+        ir.ArrayAttr.get(
+            [ir.AffineMapAttr.get(const_affine_map), ir.AffineMapAttr.get(const_affine_map)]
+        ),
+        ir.ArrayAttr.get(
+            [ir.Attribute.parse("#linalg.iterator_type<parallel>")] * dim_count
+        ),
+    )
+    block = ir.Block.create_at_start(
+        op.region,
+        [
+            ir.RankedTensorType(input1.type).element_type,
+            ir.RankedTensorType(outputs.result.type).element_type,
+        ],
+    )
+    
+    negf = arith.NegFOp(block.arguments[0])
+    block.append(negf)
+    block.append(linalg.YieldOp([negf.result]))
 
     return op
 
@@ -2593,6 +2623,45 @@ def le_op(
     return cmp_op
 
 
+def int_matmul_op(
+    node: IntMatmulOp,
+    symbol_table: Dict[Tuple[str, int], ir.Operation],
+):
+    """
+    Import the tensor int_matmul operation.
+    From Buddy IntMatmulOp to MLIR linalg `matmul` operation with i8 tensor as input and i32 tensor as output.
+
+    Note: This op, compute input node's matrix multiplication result.
+    Args:
+        node: Containing information from the input graph node.
+        symbol_table: A dictionary mapping symbols to their corresponding
+        operations.
+
+    Returns:
+        op: The operation return the linalg.matmul op.
+    """
+    assert len(node.args) == 2
+    input1 = symbol_table.get((str(node.args[0]), 0))
+    input2 = symbol_table.get((str(node.args[1]), 0))
+    if input1 is None or input2 is None:
+        return
+
+    output_shape = list(node.tensor_meta["shape"])
+    dtype = node.tensor_meta["dtype"]
+    
+    assert(dtype == TensorDType.Int32)
+    assert(ir.RankedTensorType(input1.type).element_type == ir.IntegerType.get_signless(8))
+    assert(ir.RankedTensorType(input2.type).element_type == ir.IntegerType.get_signless(8))
+    
+    mlir_dtype = mlir_element_type_get(dtype)
+    tensor_type = ir.RankedTensorType.get(output_shape, mlir_dtype)
+    element = mlir_element_attr_get(dtype, 0)
+    attr = ir.DenseElementsAttr.get_splat(tensor_type, element)
+    matmul_result_buffer = arith.ConstantOp(tensor_type, attr).result
+    op = linalg.matmul(input1, input2, outs=[matmul_result_buffer])
+    return op
+
+
 ops_registry = {
     "MatmulOp": matmul_op,
     "TransposeMatmulFusedOp": matmul_transpose_b_op,
@@ -2637,4 +2706,5 @@ ops_registry = {
     "SliceScatterOp": slice_scatter_op,
     "NeOp": ne_op,
     "LeOp": le_op,
+    "IntMatmulOp": int_matmul_op,
 }

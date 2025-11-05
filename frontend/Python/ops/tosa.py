@@ -39,6 +39,7 @@ from ..graph import (
     ExpOp,
     RsqrtOp,
     AmaxOp,
+    AminOp,
     ReshapeOp,
     UnsqueezeOp,
     SelectOp,
@@ -65,6 +66,9 @@ from ..graph import (
     ScaledDotProductFlashAttentionForCpuOp,
     BitwiseAndOp,
     WeightInt4PackMMForCpuOp,
+    MaximumOp,
+    MinimumOp,
+    RoundOp,
 )
 from .utils import *
 
@@ -74,10 +78,24 @@ def _normalize_binary_operator_shape(shp1, shp2):
     rule"""
     shp1 = list(shp1)
     shp2 = list(shp2)
-    while len(shp1) < len(shp2):
-        shp1.insert(0, 1)
-    while len(shp2) < len(shp1):
-        shp2.insert(0, 1)
+    # print(shp1, shp2)
+    if len(shp1) < len(shp2):
+        for i in range(len(shp2) - len(shp1) + 1):
+            if shp2[i : i + len(shp1)] == shp1:
+                tmp = [1] * i
+                shp1.extend([1] * (len(shp2) - (len(shp1) + i)))
+                tmp.extend(shp1)
+                shp1 = tmp
+                break
+            
+    if len(shp2) < len(shp1):
+        for i in range(len(shp1) - len(shp2) + 1):
+            if shp1[i : i + len(shp2)] == shp2:
+                tmp = [1] * i
+                shp2.extend([1] * (len(shp1) - (len(shp2) + i)))
+                tmp.extend(shp2)
+                shp2 = tmp
+                break
 
     return shp1, shp2
 
@@ -380,8 +398,50 @@ def div_op(node: DivOp, symbol_table):
             ir.IntegerAttr.get(ir.IntegerType.get_signless(8), 0),
         )
 
-    input1 = symbol_table.get((str(node.args[0]), 0), node.args[0])
-    input2 = symbol_table.get((str(node.args[1]), 0), node.args[1])
+    # input1 = symbol_table.get((str(node.args[0]), 0), node.args[0])
+    # input2 = symbol_table.get((str(node.args[1]), 0), node.args[1])
+    
+    dtype = node.tensor_meta["dtype"]
+    mlir_dtype = mlir_element_type_get(dtype)
+
+    if isinstance(node.args[0], str):
+        input1 = symbol_table.get((str(node.args[0]), 0), node.args[0])
+    else:
+        data = [node.args[0]]
+        input1_shape = numpy.array(data).shape
+        tensor_type = ir.RankedTensorType.get(input1_shape, mlir_dtype)
+        element = mlir_element_attr_get(dtype, node.args[0])
+        attr = ir.DenseElementsAttr.get_splat(tensor_type, element)
+        input2 = arith.ConstantOp(tensor_type, attr).result
+
+    if isinstance(node.args[1], str):
+        input2 = symbol_table.get((str(node.args[1]), 0), node.args[1])
+    else:
+        data = [node.args[1]]
+        input2_shape = numpy.array(data).shape
+        tensor_type = ir.RankedTensorType.get(input2_shape, mlir_dtype)
+        element = mlir_element_attr_get(dtype, node.args[1])
+        attr = ir.DenseElementsAttr.get_splat(tensor_type, element)
+        input2 = arith.ConstantOp(tensor_type, attr).result
+
+    input1_dtype = ir.RankedTensorType(input1.type).element_type
+    input2_dtype = ir.RankedTensorType(input2.type).element_type
+    if input1_dtype != mlir_dtype:
+        input1 = tosa.CastOp(
+            ir.RankedTensorType.get(
+                ir.RankedTensorType(input1.type).shape,
+                mlir_dtype,
+            ),
+            input1,
+        ).result
+    if input2_dtype != mlir_dtype:
+        input2 = tosa.CastOp(
+            ir.RankedTensorType.get(
+                ir.RankedTensorType(input2.type).shape,
+                mlir_dtype,
+            ),
+            input2,
+        ).result
 
     return _gen_arith_binary_op(input1, input2, _inner_op)
 
@@ -437,9 +497,123 @@ def amax_op(node: AmaxOp, symbol_table):
     dim_val = node.args[1][0]
     if dim_val < 0:
         dim_val += len(ir.RankedTensorType(input1.type).shape)
-    signless_type = ir.IntegerType.get_signless(32)
-    dim_attr = ir.IntegerAttr.get(signless_type, dim_val)
-    op = tosa.ReduceMaxOp(input1, dim_attr)
+    # signless_type = ir.IntegerType.get_signless(32)
+    # dim_attr = ir.IntegerAttr.get(signless_type, dim_val)
+    # op = tosa.ReduceMaxOp(input1, dim_attr)
+    
+    input_shape = ir.RankedTensorType(input1.type).shape
+    output_shape = list(node.tensor_meta["shape"])
+    output_dtype = mlir_element_type_get(node.tensor_meta["dtype"])
+    outputs = tensor.EmptyOp(output_shape, output_dtype)
+    result_tensors = ir.RankedTensorType.get(output_shape, output_dtype)
+    
+    dim_count = len(input_shape)
+    const_affine_expr = [ir.AffineDimExpr.get(i) for i in range(dim_count)]
+    reduction_affine_expr = const_affine_expr.copy()
+    reduction_affine_expr.pop(dim_val)
+    
+    const_affine_map = ir.AffineMap.get(
+        dim_count=dim_count, 
+        symbol_count=0, 
+        exprs=const_affine_expr
+    )  # affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+    reduction_affine_map = ir.AffineMap.get(
+        dim_count=dim_count, 
+        symbol_count=0, 
+        exprs=reduction_affine_expr
+    )
+    
+    iterator_types = [ir.Attribute.parse("#linalg.iterator_type<parallel>")] * dim_count
+    iterator_types[dim_val] = ir.Attribute.parse("#linalg.iterator_type<reduction>")
+    
+    op = linalg.GenericOp(
+        [result_tensors],
+        [input1],
+        [outputs],
+        ir.ArrayAttr.get(
+            [ir.AffineMapAttr.get(const_affine_map), ir.AffineMapAttr.get(reduction_affine_map)]
+        ),
+        ir.ArrayAttr.get(
+            iterator_types
+        ),
+    )
+    block = ir.Block.create_at_start(
+        op.region,
+        [
+            ir.RankedTensorType(input1.type).element_type,
+            ir.RankedTensorType(outputs.result.type).element_type,
+        ],
+    )
+    
+    reduce_max = arith.MaximumFOp(block.arguments[0], block.arguments[1])
+    block.append(reduce_max)
+    block.append(linalg.YieldOp([reduce_max.result]))
+    
+    return op
+
+
+def amin_op(node: AminOp, symbol_table):
+    """
+    Import the amin operation.
+    From buddy graph ir's `AminOp` operator to MLIR TOSA `reduce_min`
+    operation.
+    """
+    input1 = symbol_table.get((str(node.args[0]), 0))
+    dim_val = node.args[1][0]
+    if dim_val < 0:
+        dim_val += len(ir.RankedTensorType(input1.type).shape)
+    # signless_type = ir.IntegerType.get_signless(32)
+    # dim_attr = ir.IntegerAttr.get(signless_type, dim_val)
+    # op = tosa.ReduceMaxOp(input1, dim_attr)
+    
+    input_shape = ir.RankedTensorType(input1.type).shape
+    output_shape = list(node.tensor_meta["shape"])
+    output_dtype = mlir_element_type_get(node.tensor_meta["dtype"])
+    outputs = tensor.EmptyOp(output_shape, output_dtype)
+    result_tensors = ir.RankedTensorType.get(output_shape, output_dtype)
+    
+    dim_count = len(input_shape)
+    const_affine_expr = [ir.AffineDimExpr.get(i) for i in range(dim_count)]
+    reduction_affine_expr = const_affine_expr.copy()
+    reduction_affine_expr.pop(dim_val)
+    
+    const_affine_map = ir.AffineMap.get(
+        dim_count=dim_count, 
+        symbol_count=0, 
+        exprs=const_affine_expr
+    )  # affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+    reduction_affine_map = ir.AffineMap.get(
+        dim_count=dim_count, 
+        symbol_count=0, 
+        exprs=reduction_affine_expr
+    )
+    
+    iterator_types = [ir.Attribute.parse("#linalg.iterator_type<parallel>")] * dim_count
+    iterator_types[dim_val] = ir.Attribute.parse("#linalg.iterator_type<reduction>")
+    
+    op = linalg.GenericOp(
+        [result_tensors],
+        [input1],
+        [outputs],
+        ir.ArrayAttr.get(
+            [ir.AffineMapAttr.get(const_affine_map), ir.AffineMapAttr.get(reduction_affine_map)]
+        ),
+        ir.ArrayAttr.get(
+            iterator_types
+        ),
+    )
+    block = ir.Block.create_at_start(
+        op.region,
+        [
+            ir.RankedTensorType(input1.type).element_type,
+            ir.RankedTensorType(outputs.result.type).element_type,
+        ],
+    )
+    
+    reduce_max = arith.MinimumFOp(block.arguments[0], block.arguments[1])
+    block.append(reduce_max)
+    block.append(linalg.YieldOp([reduce_max.result]))
+    
     return op
 
 
@@ -605,6 +779,7 @@ def convert_element_type_op(node: ConvertElementTypeOp, symbol_table):
         TensorDType.Float16: ir.F16Type.get(),
         TensorDType.Int64: ir.IntegerType.get_signless(64),
         TensorDType.Int32: ir.IntegerType.get_signless(32),
+        TensorDType.Int8: ir.IntegerType.get_signless(8),
         TensorDType.Bool: ir.IntegerType.get_signless(1),
     }
     input_tensor = symbol_table.get((str(node.args[0]), 0))
@@ -951,7 +1126,6 @@ def expand_op(node: ExpandOp, symbol_table) -> ir.Operation:
         to_expand_tensor.type
     ).element_type
     
-    print(result_element_type)
     if result_element_type in (
         ir.IntegerType.get_signless(1),
         ir.IntegerType.get_signless(64),
@@ -2027,8 +2201,79 @@ def weight_int4pack_mm_for_cpu_op(node: WeightInt4PackMMForCpuOp, symbol_table):
     matmul_result_buffer = arith.ConstantOp(matmul_result, matmul_result_attr).result
     op = linalg.matmul(input, transposed_weight.result, outs=[matmul_result_buffer])
     return op
+
+
+def maximum_op(node: MaximumOp, symbol_table):
+    """
+    Import tensor maximum operation.
+    From buddy graph ir's `MaximumOp` operator to MLIR TOSA `maximum` operation.
+    """
+    input1 = symbol_table.get((str(node.args[0]), 0), node.args[0])
+    input2 = symbol_table.get((str(node.args[1]), 0), node.args[1])
+    dtype = node.tensor_meta["dtype"]
+    mlir_dtype = mlir_element_type_get(dtype)
+    if isinstance(node.args[0], str) and isinstance(node.args[1], str):
+        input1_dtype = ir.RankedTensorType(input1.type).element_type
+        input2_dtype = ir.RankedTensorType(input2.type).element_type
+        if input1_dtype != mlir_dtype:
+            input1 = tosa.CastOp(
+                ir.RankedTensorType.get(
+                    ir.RankedTensorType(input1.type).shape,
+                    mlir_dtype,
+                ),
+                input1,
+            ).result
+        if input2_dtype != mlir_dtype:
+            input2 = tosa.CastOp(
+                ir.RankedTensorType.get(
+                    ir.RankedTensorType(input2.type).shape,
+                    mlir_dtype,
+                ),
+                input2,
+            ).result
+    return _gen_arith_binary_op(input1, input2, tosa.MaximumOp)
+
+
+def minimum_op(node: MinimumOp, symbol_table):
+    """
+    Import tensor minimum operation.
+    From buddy graph ir's `MinimumOp` operator to MLIR TOSA `minimum` operation.
+    """
+    input1 = symbol_table.get((str(node.args[0]), 0), node.args[0])
+    input2 = symbol_table.get((str(node.args[1]), 0), node.args[1])
+    dtype = node.tensor_meta["dtype"]
+    mlir_dtype = mlir_element_type_get(dtype)
+    if isinstance(node.args[0], str) and isinstance(node.args[1], str):
+        input1_dtype = ir.RankedTensorType(input1.type).element_type
+        input2_dtype = ir.RankedTensorType(input2.type).element_type
+        if input1_dtype != mlir_dtype:
+            input1 = tosa.CastOp(
+                ir.RankedTensorType.get(
+                    ir.RankedTensorType(input1.type).shape,
+                    mlir_dtype,
+                ),
+                input1,
+            ).result
+        if input2_dtype != mlir_dtype:
+            input2 = tosa.CastOp(
+                ir.RankedTensorType.get(
+                    ir.RankedTensorType(input2.type).shape,
+                    mlir_dtype,
+                ),
+                input2,
+            ).result
+    return _gen_arith_binary_op(input1, input2, tosa.MinimumOp)
+
+
+def round_op(node: RoundOp, symbol_table: dict):
+    input = symbol_table.get((str(node.args[0]), 0))
     
-    
+    sizes = ir.RankedTensorType(input.type).shape
+    result_element_type = ir.RankedTensorType(input.type).element_type
+    output_type = ir.RankedTensorType.get(sizes, result_element_type)
+  
+    return tosa.FloorOp(output_type, input)
+
 
 ops_registry = {
     "AddOp": add_op,
@@ -2037,6 +2282,7 @@ ops_registry = {
     "SumDimOp": sum_op,
     "TanhOp": tanh_op,
     "AmaxOp": amax_op,
+    "AminOp": amin_op,
     "RsqrtOp": rsqrt_op,
     "BatchMatmulOp": bmm_op,
     "CloneOp": clone_op,
@@ -2069,4 +2315,7 @@ ops_registry = {
     "ScaledDotProductFlashAttentionForCpuOp": scaled_dot_product_flash_attention_for_cpu_op,
     "BitwiseAndOp": bitwise_and_op,
     "WeightInt4PackMMForCpuOp": weight_int4pack_mm_for_cpu_op,
+    "MaximumOp": maximum_op,
+    "MinimumOp": minimum_op,
+    "RoundOp": round_op,
 }

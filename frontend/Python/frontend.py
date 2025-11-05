@@ -147,6 +147,7 @@ class DynamoCompiler:
             "sub.Tensor": SubOp,
             "var_mean.correction": VarMeanOp,
             "amax.default": AmaxOp,
+            "amin.default": AminOp,
             "select.int": SelectOp,
             "exp.default": ExpOp,
             "erf.default": ErfOp,
@@ -180,6 +181,10 @@ class DynamoCompiler:
             "le.Scalar": LeOp,
             "bitwise_and.Tensor": BitwiseAndOp,
             "_weight_int4pack_mm_for_cpu.default": WeightInt4PackMMForCpuOp,
+            "maximum.default": MaximumOp,
+            "minimum.default": MinimumOp,
+            "round.default": RoundOp,
+            "_int_mm.default": IntMatmulOp,
         }
 
     @property
