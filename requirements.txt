@@ -1,5 +1,5 @@
---pre --extra-index-url https://download.pytorch.org/whl/cpu
-torch == 2.5.1
+--pre --extra-index-url https://download.pytorch.org/whl/cu126
+torch == 2.8.0
 numpy < 2
 transformers == 4.46.2
 tokenizers >= 0.20
@@ -7,7 +7,7 @@ sentencepiece == 0.2.0
 accelerate
 protobuf
 pybind11 == 2.11.1
-torchvision
+torchvision == 0.23.0 
 tabulate
 datasets
 soundfile
@@ -17,3 +17,4 @@ certifi
 idna
 diffusers
 pre-commit
+torchaudio == 2.8.0
